@@ -4,7 +4,6 @@ from typing import Optional, Any, Dict
 from models import Resume
 import datetime # Import datetime module
 import logging # Import logging
-
 # --- Initialize Supabase Client ---
 # Ensure URL and Key are provided
 if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
@@ -12,23 +11,51 @@ if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
 
 supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY)
 
-# --- Supabase Functions ---
-def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
+
+def _job_pk_col() -> str:
+    return getattr(config, "SUPABASE_JOB_PK_COL", "id")
+
+
+def normalize_job_row(row: Optional[dict]) -> Optional[dict]:
     """
-    Fetches all existing job IDs and company-title pairs from the Supabase 'jobs' table.
+    Map DB row (id, title, source, …) to keys expected by older code paths (job_id, job_title, provider).
+    """
+    if not row:
+        return None
+    pk = _job_pk_col()
+    out = dict(row)
+    rid = out.get(pk)
+    if rid is not None:
+        out["job_id"] = str(rid)
+    if out.get("title") is not None and out.get("job_title") is None:
+        out["job_title"] = out["title"]
+    if out.get("source") is not None and out.get("provider") is None:
+        out["provider"] = out["source"]
+    if out.get("level") is None:
+        out["level"] = "N/A"
+    return out
+
+
+# --- Supabase Functions ---
+def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set, set]:
+    """
+    Fetches primary keys, company|title pairs, and canonical job URLs (for deduping scrapers).
     Returns:
-        - A set of job_ids
-        - A set of 'company|job_title' keys (both lowercased for consistency)
+        - A set of primary key values (as strings)
+        - A set of 'company|title' keys (both lowercased for consistency)
+        - A set of lowercased `url` values (scrapers match on URL, not DB uuid)
     """
     existing_ids = set()
     existing_company_title_keys = set()
+    existing_urls: set[str] = set()
     offset = 0
+    pk = _job_pk_col()
 
     try:
         while True:
             response = (
                 supabase.table(config.SUPABASE_TABLE_NAME)
-                .select("job_id, company, job_title")
+                .select(f"{pk}, company, title, url")
                 .range(offset, offset + batch_size - 1)
                 .execute()
             )
@@ -39,17 +66,21 @@ def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
                 break  # No more data to fetch
 
             for item in data:
-                job_id = item.get("job_id")
+                job_pk = item.get(pk)
                 company = item.get("company")
-                job_title = item.get("job_title")
+                title = item.get("title")
+                url = item.get("url")
 
-                if job_id:
-                    existing_ids.add(str(job_id))
+                if job_pk:
+                    existing_ids.add(str(job_pk))
 
-                if company and job_title:
+                if company and title:
                     normalized_company = company.strip().lower()
-                    normalized_title = job_title.strip().lower()
+                    normalized_title = title.strip().lower()
                     existing_company_title_keys.add((normalized_company, normalized_title))
+
+                if url and str(url).strip():
+                    existing_urls.add(str(url).strip().lower())
 
             offset += batch_size
 
@@ -58,34 +89,48 @@ def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set]:
     except Exception as e:
         print(f"Error fetching existing jobs from Supabase: {e}")
 
-    return existing_ids, existing_company_title_keys
+    return existing_ids, existing_company_title_keys, existing_urls
+
+def _scraper_job_to_row(job: dict) -> Optional[dict]:
+    """Map legacy scraper output (job_id, job_title, provider, …) to canonical jobs columns."""
+    jid = job.get("job_id")
+    src = job.get("provider") or job.get("source") or ""
+    url = (job.get("url") or "").strip()
+    if not url and jid:
+        if src == "careers_future":
+            url = f"https://www.mycareersfuture.gov.sg/job/{jid}"
+        else:
+            url = f"https://www.linkedin.com/jobs/view/{jid}"
+    if not url and job.get("uuid"):
+        url = f"https://www.mycareersfuture.gov.sg/job/{job['uuid']}"
+    if not url:
+        return None
+    title = job.get("job_title") or job.get("title") or ""
+    return {
+        "url": url,
+        "title": title,
+        "company": (job.get("company") or "").strip() or None,
+        "description": job.get("description") or "",
+        "source": job.get("provider") or job.get("source") or "scraper",
+    }
+
 
 def save_jobs_to_supabase(jobs_data: list):
     """
-    Saves or updates a list of job data dictionaries to the Supabase table using upsert.
-    This avoids duplicate key errors by updating existing records based on job_id.
+    Saves or updates job rows using unique `url` (canonical jobs schema).
+    Accepts legacy dicts from scraper.py (job_id, job_title, provider, …).
     """
     if not jobs_data:
         print("No job data provided to save/update.")
         return
 
-    # Ensure job_id is present and potentially convert to the correct type if needed
-    # (Assuming job_id in jobs_data is already the correct string type for your 'text' column)
     processed_jobs_data = []
     for job in jobs_data:
-        if 'job_id' in job and job['job_id'] is not None:
-             # If your Supabase job_id column was numeric, you'd convert here:
-             # try:
-             #     job['job_id'] = int(job['job_id'])
-             #     processed_jobs_data.append(job)
-             # except (ValueError, TypeError):
-             #     print(f"Warning: Invalid job_id format found: {job.get('job_id')}. Skipping.")
-             # Since it's text, just ensure it's a string (it likely already is)
-             job['job_id'] = str(job['job_id'])
-             processed_jobs_data.append(job)
+        row = _scraper_job_to_row(job)
+        if row:
+            processed_jobs_data.append(row)
         else:
-            print(f"Warning: Job data missing job_id. Skipping: {job}")
-
+            print(f"Warning: Could not build row (need url or job_id/uuid). Skipping: {job}")
 
     if not processed_jobs_data:
         print("No valid job data remaining after processing.")
@@ -94,12 +139,9 @@ def save_jobs_to_supabase(jobs_data: list):
     print(f"Attempting to upsert {len(processed_jobs_data)} jobs to Supabase...")
 
     try:
-        # Use table name from config
-        # Use upsert instead of insert. It will insert new rows
-        # or update existing rows if a job_id conflict occurs based on the primary key.
-        # Ensure 'job_id' is the primary key or has a unique constraint in your Supabase table.
-        # By default, supabase-py's upsert updates the row on conflict.
-        data, count = supabase.table(config.SUPABASE_TABLE_NAME).upsert(processed_jobs_data).execute()
+        data, count = supabase.table(config.SUPABASE_TABLE_NAME).upsert(
+            processed_jobs_data, on_conflict="url"
+        ).execute()
 
         # Check the actual response structure from your Supabase client version for upsert
         # It might differ slightly from insert's response structure
@@ -132,9 +174,9 @@ def get_jobs_to_score(limit: int) -> list:
 
     try:
         logging.info(f"Fetching up to {limit} jobs needing scoring...")
-        # Select fields needed for scoring
+        pk = _job_pk_col()
         response = supabase.table(config.SUPABASE_TABLE_NAME)\
-                           .select("job_id, job_title, company, description, level")\
+                           .select(f"{pk}, title, company, description, level")\
                            .eq("is_active", True)\
                            .is_("resume_score", None)\
                            .order("scraped_at", desc=False)\
@@ -143,7 +185,7 @@ def get_jobs_to_score(limit: int) -> list:
 
         if response.data:
             logging.info(f"Successfully fetched {len(response.data)} jobs to score.")
-            return response.data
+            return [normalize_job_row(r) for r in response.data]
         else:
             logging.info("No jobs found needing scoring at this time.")
             return []
@@ -165,8 +207,9 @@ def get_top_scored_jobs_to_apply(limit: int) -> list:
 
     try:
         logging.info(f"Fetching up to {limit} top-scored jobs to apply for...")
+        pk = _job_pk_col()
         response = supabase.table(config.SUPABASE_TABLE_NAME)\
-                           .select("job_id, job_title, company, resume_score")\
+                           .select(f"{pk}, title, company, resume_score")\
                            .eq("is_active", True)\
                            .eq("status", "new")\
                            .not_.is_("resume_score", None)\
@@ -176,7 +219,7 @@ def get_top_scored_jobs_to_apply(limit: int) -> list:
 
         if response.data:
             logging.info(f"Successfully fetched {len(response.data)} top-scored jobs to apply for.")
-            return response.data
+            return [normalize_job_row(r) for r in response.data]
         else:
             logging.info("No top-scored jobs found ready for application at this time.")
             return []
@@ -187,77 +230,86 @@ def get_top_scored_jobs_to_apply(limit: int) -> list:
 
 def get_top_scored_jobs_for_resume_generation(limit: int) -> list:
     """
-    Fetches the top-scored jobs from Supabase using the RPC 'get_top_scored_jobs_custom_sort'.
-    p_page_number is set to 1 and p_page_size is set to the limit.
-    Selects fields needed for the application process.
+    Jobs with match_score above threshold and no customized resume yet (canonical schema; no RPC).
     """
     if limit <= 0:
         logging.warning("Limit for jobs to apply must be positive.")
         return []
 
     try:
-        logging.info(f"Fetching up to {limit} top-scored jobs to apply for using RPC 'get_top_scored_jobs_custom_sort'...")
-        response = supabase.rpc(
-                "get_jobs_for_resume_generation_custom_sort",
-                {"p_page_number": 1, "p_page_size": limit}
-            ).execute()
+        min_cv = getattr(config, "MATCH_SCORE_MIN_FOR_CV", 8)
+        pk = _job_pk_col()
+        logging.info(
+            f"Fetching up to {limit} jobs for resume generation (match_score >= {min_cv}, customized_resume_id is null)..."
+        )
+        response = (
+            supabase.table(config.SUPABASE_TABLE_NAME)
+            .select(f"{pk}, title, company, level, location, description, match_score, customized_resume_id")
+            .is_("customized_resume_id", None)
+            .not_.is_("match_score", None)
+            .gte("match_score", min_cv)
+            .order("match_score", desc=True)
+            .limit(limit)
+            .execute()
+        )
 
         if response.data:
-            logging.info(f"Successfully fetched {len(response.data)} top-scored jobs to apply for via RPC.")
-            return response.data
-        else:
-            # Check for RPC specific errors if any, or just log general empty data
-            if hasattr(response, 'error') and response.error:
-                logging.error(f"Error calling RPC 'get_top_scored_jobs_custom_sort': {response.error.message}")
-            else:
-                logging.info("No top-scored jobs found ready for application at this time via RPC.")
-            return []
+            logging.info(f"Successfully fetched {len(response.data)} job(s) for resume generation.")
+            return [normalize_job_row(r) for r in response.data]
+        logging.info("No jobs found for resume generation at this time.")
+        return []
 
     except Exception as e:
-        logging.error(f"Error fetching top-scored jobs to apply for from Supabase RPC: {e}")
+        logging.error(f"Error fetching jobs for resume generation: {e}")
         return []
 
 def get_jobs_to_rescore(limit: int) -> list:
     """
-    Fetches jobs from Supabase that are ready for re-scoring with a custom resume.
-    Filters by is_active = true, resume_link is not null, and resume_score_stage = 'initial'.
-    Orders by resume_score descending.
-    Selects fields needed for the re-scoring process.
+    Jobs with a customized resume still at initial scoring stage (direct query; no RPC).
     """
     if limit <= 0:
         logging.warning("Limit for jobs to rescore must be positive.")
         return []
 
     try:
-        logging.info(f"Fetching up to {limit} jobs for re-scoring via RPC...")
-        # Note: We updated the RPC to also return customized_resume_id
-        response = supabase.rpc(
-            "get_jobs_for_rescore", 
-            {"p_limit_val": limit}   
-        ).execute()
+        pk = _job_pk_col()
+        logging.info(f"Fetching up to {limit} jobs for re-scoring...")
+        response = (
+            supabase.table(config.SUPABASE_TABLE_NAME)
+            .select(f"{pk}, title, company, description, level, resume_score, customized_resume_id")
+            .eq("is_active", True)
+            .eq("status", "new")
+            .eq("resume_score_stage", "initial")
+            .not_.is_("customized_resume_id", None)
+            .order("resume_score", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        rows = response.data or []
+        out = []
+        for row in rows:
+            cr_id = row.get("customized_resume_id")
+            resume_link = None
+            if cr_id:
+                cr = get_customized_resume(str(cr_id))
+                if cr:
+                    resume_link = cr.get("resume_link")
+            row["resume_link"] = resume_link
+            out.append(normalize_job_row(row))
 
-        if hasattr(response, 'data') and response.data is not None:
-            if response.data: # Check if list is not empty
-                logging.info(f"Successfully fetched {len(response.data)} jobs for re-scoring via RPC.")
-                return response.data
-            else:
-                logging.info("No jobs found meeting re-scoring criteria via RPC at this time (empty list returned).")
-                return []
-        elif hasattr(response, 'error') and response.error: # Handle explicit error attribute
-             logging.error(f"Error calling RPC get_jobs_for_rescore: {response.error}")
-             return []
-        else: # Fallback for unexpected response structure
-            logging.warning(f"Unexpected response structure from RPC call: {response}")
-            return []
-
+        if out:
+            logging.info(f"Successfully fetched {len(out)} jobs for re-scoring.")
+        else:
+            logging.info("No jobs found meeting re-scoring criteria.")
+        return out
 
     except Exception as e:
-        logging.error(f"Exception calling RPC get_jobs_for_rescore: {e}", exc_info=True)
+        logging.error(f"Exception in get_jobs_to_rescore: {e}", exc_info=True)
         return []
 
-def update_job_score(job_id: str, score: int, resume_score_stage: str = "initial") -> bool:
+def update_job_resume_score(job_id: str, score: int, resume_score_stage: str = "initial") -> bool:
     """
-    Updates the 'resume_score' and 'resume_score_stage' for a specific job_id in the Supabase 'jobs' table.
+    Updates the legacy 'resume_score' and 'resume_score_stage' for a specific job_id in the Supabase 'jobs' table.
     Returns True on success, False on failure.
     """
     if not job_id or score is None:
@@ -269,35 +321,159 @@ def update_job_score(job_id: str, score: int, resume_score_stage: str = "initial
         return False
 
     try:
-        logging.info(f"Updating score for job_id {job_id} to {score} and stage to {resume_score_stage}...")
+        logging.info(f"Updating resume_score for job_id {job_id} to {score} and stage to {resume_score_stage}...")
         update_payload = {
             "resume_score": score,
             "resume_score_stage": resume_score_stage
         }
         response = supabase.table(config.SUPABASE_TABLE_NAME)\
                            .update(update_payload)\
-                           .eq("job_id", job_id)\
+                           .eq(_job_pk_col(), job_id)\
                            .execute()
 
-        # Check if the update was successful (response structure might vary)
-        # A common pattern is checking if data is returned or count is non-zero
         if hasattr(response, 'data') and response.data:
-             logging.info(f"Successfully updated score for job_id {job_id}.")
+             logging.info(f"Successfully updated resume_score for job_id {job_id}.")
              return True
         elif hasattr(response, 'count') and response.count is not None and response.count > 0:
-             logging.info(f"Successfully updated score for job_id {job_id} (count={response.count}).")
+             logging.info(f"Successfully updated resume_score for job_id {job_id} (count={response.count}).")
              return True
         elif not hasattr(response, 'data') and not hasattr(response, 'count'):
-             # Handle cases where the response might not have data/count but didn't error
-             logging.warning(f"Update score for job_id {job_id} executed, but response structure unclear: {response}")
-             return True # Assume success if no exception occurred
+             logging.warning(f"Update resume_score for job_id {job_id} executed, but response structure unclear: {response}")
+             return True
         else:
-             logging.warning(f"Update score for job_id {job_id} might have failed or job not found. Response: {response}")
+             logging.warning(f"Update resume_score for job_id {job_id} might have failed or job not found. Response: {response}")
              return False
 
-
     except Exception as e:
-        logging.error(f"Error updating score for job_id {job_id} in Supabase: {e}")
+        logging.error(f"Error updating resume_score for job_id {job_id} in Supabase: {e}")
+        return False
+
+
+def insert_job_if_new(job: dict) -> bool:
+    """Insert job only if URL not already in table. Returns True if inserted."""
+    url = (job.get("url") or "").strip()
+    if not url:
+        logging.warning("insert_job_if_new: missing url, skipping.")
+        return False
+
+    try:
+        existing = (
+            supabase.table(config.SUPABASE_TABLE_NAME)
+            .select(_job_pk_col())
+            .eq("url", url)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            logging.debug(f"Job URL already exists: {url[:80]}...")
+            return False
+    except Exception as e:
+        logging.error(f"insert_job_if_new: error checking URL: {e}")
+        return False
+
+    row = {
+        "url": url,
+        "title": job.get("title") or "",
+        "company": job.get("company") or "",
+        "description": job.get("description") or "",
+        "source": job.get("source") or job.get("provider") or "",
+        "country": job.get("country"),
+    }
+    if job.get("location"):
+        row["location"] = job["location"]
+    if job.get("level"):
+        row["level"] = job["level"]
+
+    try:
+        supabase.table(config.SUPABASE_TABLE_NAME).insert(row).execute()
+        logging.info(f"Inserted new job ({url[:60]}...).")
+        return True
+    except Exception as e:
+        logging.error(f"insert_job_if_new: insert failed: {e}")
+        return False
+
+
+def get_unscored_jobs(country: str, limit: int = 100) -> list:
+    """Get jobs with no match_score for a given country."""
+    if not country:
+        return []
+    try:
+        pk = _job_pk_col()
+        q = (
+            supabase.table(config.SUPABASE_TABLE_NAME)
+            .select(f"{pk}, title, company, description, level, country")
+            .eq("country", country)
+            .is_("match_score", None)
+            .order("scraped_at", desc=False)
+        )
+        if limit and limit > 0:
+            q = q.limit(limit)
+        response = q.execute()
+        rows = response.data or []
+        return [normalize_job_row(r) for r in rows]
+    except Exception as e:
+        logging.error(f"get_unscored_jobs: {e}")
+        return []
+
+
+def update_job_score(job_id: str, score: int, reason: str) -> bool:
+    """Update match_score and match_reason for a job."""
+    if not job_id or score is None:
+        logging.error(f"update_job_score: invalid job_id={job_id}, score={score}")
+        return False
+    try:
+        payload = {"match_score": score, "match_reason": reason or ""}
+        response = (
+            supabase.table(config.SUPABASE_TABLE_NAME)
+            .update(payload)
+            .eq(_job_pk_col(), job_id)
+            .execute()
+        )
+        if hasattr(response, "data") and response.data:
+            return True
+        if hasattr(response, "count") and response.count is not None and response.count > 0:
+            return True
+        logging.warning(f"update_job_score: no rows updated for job_id={job_id}")
+        return False
+    except Exception as e:
+        logging.error(f"update_job_score: {e}")
+        return False
+
+
+def get_unnotified_matches(country: str, threshold: int) -> list:
+    """Get high-scoring unnotified jobs for a country (match_score strictly above threshold)."""
+    if not country:
+        return []
+    try:
+        pk = _job_pk_col()
+        response = (
+            supabase.table(config.SUPABASE_TABLE_NAME)
+            .select(
+                f"{pk}, title, company, description, url, source, match_score, match_reason, scraped_at, notified"
+            )
+            .eq("country", country)
+            .gt("match_score", threshold)
+            .order("match_score", desc=True)
+            .limit(200)
+            .execute()
+        )
+        rows = [r for r in (response.data or []) if r.get("notified") is not True]
+        return [normalize_job_row(r) or r for r in rows]
+    except Exception as e:
+        logging.error(f"get_unnotified_matches: {e}")
+        return []
+
+
+def mark_jobs_notified(job_ids: list) -> bool:
+    """Set notified=true for a list of job IDs."""
+    if not job_ids:
+        return True
+    try:
+        supabase.table(config.SUPABASE_TABLE_NAME).update({"notified": True}).in_(_job_pk_col(), job_ids).execute()
+        logging.info(f"mark_jobs_notified: updated {len(job_ids)} job(s).")
+        return True
+    except Exception as e:
+        logging.error(f"mark_jobs_notified: {e}")
         return False
 
 def get_job_by_id(job_id: str) -> dict | None:
@@ -312,16 +488,17 @@ def get_job_by_id(job_id: str) -> dict | None:
         return None
 
     try:
+        pk = _job_pk_col()
         logging.info(f"Fetching job details for job_id: {job_id} from table '{config.SUPABASE_TABLE_NAME}'")
         response = supabase.table(config.SUPABASE_TABLE_NAME)\
-                           .select("company, job_title, level, description")\
-                           .eq("job_id", job_id) \
+                           .select(f"{pk}, company, title, level, description, country, url, customized_resume_id")\
+                           .eq(pk, job_id) \
                            .limit(1)\
-                           .execute() # Assuming 'job_id' is the column name
+                           .execute()
 
         if response.data:
             logging.info(f"Successfully fetched job data for job_id: {job_id}.")
-            return response.data[0] # Return the first matching job
+            return normalize_job_row(response.data[0])
         else:
             logging.warning(f"No job found for job_id: {job_id}")
             return None
@@ -402,7 +579,7 @@ def update_job_with_resume_link(job_id: str, customized_resume_id: str,  new_sta
 
         response = supabase.table(config.SUPABASE_TABLE_NAME)\
                            .update(update_data)\
-                           .eq("job_id", job_id)\
+                           .eq(_job_pk_col(), job_id)\
                            .execute()
 
         # Check if the update affected any rows (response.data might contain updated rows)
@@ -419,21 +596,35 @@ def update_job_with_resume_link(job_id: str, customized_resume_id: str,  new_sta
         logging.error(f"Error updating job {job_id} in Supabase: {e}")
         return False
 
-def save_customized_resume(resume_data: 'Resume', resume_path: str) -> Optional[Any]: # Return type changed
+def update_customized_resume_link(resume_id: str, resume_link: str) -> bool:
+    """Sets resume_link on a customized_resumes row (e.g. after PDF upload)."""
+    if not resume_id or not resume_link:
+        return False
+    try:
+        supabase.table(config.SUPABASE_CUSTOMIZED_RESUMES_TABLE_NAME).update(
+            {"resume_link": resume_link}
+        ).eq("id", resume_id).execute()
+        logging.info("Updated customized resume %s with storage path.", resume_id)
+        return True
+    except Exception as e:
+        logging.error("update_customized_resume_link: %s", e)
+        return False
+
+
+def save_customized_resume(resume_data: 'Resume', resume_path: Optional[str] = None) -> Optional[Any]: # Return type changed
     """
     Saves a customized resume to the Supabase 'customized_resumes' table.
 
     Args:
         resume_data: A Resume object (Pydantic model) containing the resume details.
-        resume_path: The path of the uploaded resume in storage.
+        resume_path: The path of the uploaded resume in storage (optional if PDF is generated in a later step).
 
     Returns:
         The ID (typically string UUID or integer) of the inserted resume if successful, None otherwise.
     """
 
-    if not resume_path:
-        logging.error("Resume Path is required for saving the resume.")
-        return False
+    if resume_path is None:
+        logging.info("Saving customized resume without storage path (PDF may follow in a separate step).")
 
     if not resume_data:
         logging.error("No resume data provided to save.")
@@ -451,7 +642,8 @@ def save_customized_resume(resume_data: 'Resume', resume_path: str) -> Optional[
         else:
             data_to_insert = resume_data.dict(exclude_none=True)
 
-        data_to_insert['resume_link'] = resume_path
+        if resume_path:
+            data_to_insert['resume_link'] = resume_path
 
         logging.info(
             f"Saving customized resume for email: {getattr(resume_data, 'email', 'N/A')} "
@@ -565,7 +757,7 @@ def download_resume_from_storage(file_name: str = "resume.pdf") -> Optional[byte
 def save_base_resume(resume_data: dict) -> bool:
     """
     Saves (upserts) the parsed base resume JSON to the 'base_resume' table.
-    Deletes any existing rows first to ensure only one base resume exists.
+    Updates the latest existing row when present; inserts a new row otherwise.
 
     Args:
         resume_data: The parsed resume data as a dictionary.
@@ -579,21 +771,35 @@ def save_base_resume(resume_data: dict) -> bool:
 
     table_name = config.SUPABASE_BASE_RESUME_TABLE_NAME
     try:
-        # Delete any existing base resume rows (there should only be one)
-        logging.info(f"Clearing existing base resume data from '{table_name}'...")
-        supabase.table(table_name).delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+        latest_response = (
+            supabase.table(table_name)
+            .select("id")
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
 
-        # Insert the new base resume
-        logging.info(f"Saving parsed base resume to '{table_name}'...")
-        response = supabase.table(table_name).insert({
-            "resume_data": resume_data
-        }).execute()
+        existing_rows = latest_response.data or []
+        if existing_rows:
+            existing_id = existing_rows[0].get("id")
+            logging.info(f"Updating existing base resume row in '{table_name}' (id={existing_id})...")
+            response = (
+                supabase.table(table_name)
+                .update({"resume_data": resume_data})
+                .eq("id", existing_id)
+                .execute()
+            )
+        else:
+            logging.info(f"No existing base resume row found; inserting into '{table_name}'...")
+            response = supabase.table(table_name).insert({
+                "resume_data": resume_data
+            }).execute()
 
         if response.data and len(response.data) > 0:
             logging.info(f"Successfully saved base resume to '{table_name}'.")
             return True
         else:
-            logging.warning(f"Base resume insert returned no data. Response: {response}")
+            logging.warning(f"Base resume write returned no data. Response: {response}")
             return False
 
     except Exception as e:

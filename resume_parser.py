@@ -125,7 +125,7 @@ def main():
     if save_success:
         print("Successfully saved parsed resume to Supabase database.")
     else:
-        print("WARNING: Failed to save parsed resume to Supabase database.")
+        raise RuntimeError("Failed to save parsed resume to Supabase database.")
 
     # 5. Also save to local JSON file (for development/fallback)
     output_path = config.BASE_RESUME_PATH
