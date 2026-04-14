@@ -258,7 +258,12 @@ def score_jobs_for_country(country: str) -> None:
         return
 
     resume_text = format_resume_to_text(default_resume_data)
-    limit = max(1, getattr(config, "JOBS_TO_SCORE_PER_RUN", 5))
+    country_cap = (
+        getattr(config, "JOBS_TO_SCORE_PER_RUN_UK", 10)
+        if country == config.COUNTRY_UK
+        else getattr(config, "JOBS_TO_SCORE_PER_RUN_TAIWAN", 10)
+    )
+    limit = max(1, country_cap)
     jobs = supabase_utils.get_unscored_jobs(country, limit=limit)
     if not jobs:
         logging.info("No unscored jobs for country %s.", country)

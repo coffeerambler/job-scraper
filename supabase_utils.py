@@ -106,13 +106,30 @@ def _scraper_job_to_row(job: dict) -> Optional[dict]:
     if not url:
         return None
     title = job.get("job_title") or job.get("title") or ""
-    return {
+    row = {
         "url": url,
         "title": title,
         "company": (job.get("company") or "").strip() or None,
         "description": job.get("description") or "",
         "source": job.get("provider") or job.get("source") or "scraper",
     }
+    if job.get("country"):
+        row["country"] = job.get("country")
+    if job.get("location"):
+        row["location"] = job.get("location")
+    if job.get("level"):
+        row["level"] = job.get("level")
+    if job.get("salary_min") is not None:
+        row["salary_min"] = job.get("salary_min")
+    if job.get("salary_max") is not None:
+        row["salary_max"] = job.get("salary_max")
+    if job.get("salary_currency"):
+        row["salary_currency"] = job.get("salary_currency")
+    if job.get("salary_period"):
+        row["salary_period"] = job.get("salary_period")
+    if job.get("priority_score") is not None:
+        row["priority_score"] = job.get("priority_score")
+    return row
 
 
 def save_jobs_to_supabase(jobs_data: list):
@@ -175,13 +192,28 @@ def get_jobs_to_score(limit: int) -> list:
     try:
         logging.info(f"Fetching up to {limit} jobs needing scoring...")
         pk = _job_pk_col()
-        response = supabase.table(config.SUPABASE_TABLE_NAME)\
-                           .select(f"{pk}, title, company, description, level")\
-                           .eq("is_active", True)\
-                           .is_("resume_score", None)\
-                           .order("scraped_at", desc=False)\
-                           .limit(limit)\
-                           .execute()
+        try:
+            response = (
+                supabase.table(config.SUPABASE_TABLE_NAME)
+                .select(f"{pk}, title, company, description, level")
+                .eq("is_active", True)
+                .is_("resume_score", None)
+                .order("priority_score", desc=True)
+                .order("scraped_at", desc=False)
+                .limit(limit)
+                .execute()
+            )
+        except Exception:
+            # Fallback for environments where priority_score column is not migrated yet.
+            response = (
+                supabase.table(config.SUPABASE_TABLE_NAME)
+                .select(f"{pk}, title, company, description, level")
+                .eq("is_active", True)
+                .is_("resume_score", None)
+                .order("scraped_at", desc=False)
+                .limit(limit)
+                .execute()
+            )
 
         if response.data:
             logging.info(f"Successfully fetched {len(response.data)} jobs to score.")
@@ -383,6 +415,16 @@ def insert_job_if_new(job: dict) -> bool:
         row["location"] = job["location"]
     if job.get("level"):
         row["level"] = job["level"]
+    if job.get("salary_min") is not None:
+        row["salary_min"] = job["salary_min"]
+    if job.get("salary_max") is not None:
+        row["salary_max"] = job["salary_max"]
+    if job.get("salary_currency"):
+        row["salary_currency"] = job["salary_currency"]
+    if job.get("salary_period"):
+        row["salary_period"] = job["salary_period"]
+    if job.get("priority_score") is not None:
+        row["priority_score"] = job["priority_score"]
 
     try:
         supabase.table(config.SUPABASE_TABLE_NAME).insert(row).execute()
@@ -399,17 +441,28 @@ def get_unscored_jobs(country: str, limit: int = 100) -> list:
         return []
     try:
         pk = _job_pk_col()
+        sent_urls = get_sent_job_urls(country=country, channel="discord")
+        fetch_limit = max(limit * 5, 200) if limit and limit > 0 else 500
         q = (
             supabase.table(config.SUPABASE_TABLE_NAME)
-            .select(f"{pk}, title, company, description, level, country")
+            .select(f"{pk}, title, company, description, level, country, url")
             .eq("country", country)
             .is_("match_score", None)
+            .eq("is_active", True)
+            .eq("status", "new")
+            .order("priority_score", desc=True)
             .order("scraped_at", desc=False)
         )
-        if limit and limit > 0:
-            q = q.limit(limit)
+        q = q.limit(fetch_limit)
         response = q.execute()
-        rows = response.data or []
+        rows = []
+        for r in (response.data or []):
+            u = (r.get("url") or "").strip().lower()
+            if u and u in sent_urls:
+                continue
+            rows.append(r)
+            if limit and limit > 0 and len(rows) >= limit:
+                break
         return [normalize_job_row(r) for r in rows]
     except Exception as e:
         logging.error(f"get_unscored_jobs: {e}")
@@ -446,6 +499,7 @@ def get_unnotified_matches(country: str, threshold: int) -> list:
         return []
     try:
         pk = _job_pk_col()
+        sent_urls = get_sent_job_urls(country=country, channel="discord")
         response = (
             supabase.table(config.SUPABASE_TABLE_NAME)
             .select(
@@ -457,7 +511,14 @@ def get_unnotified_matches(country: str, threshold: int) -> list:
             .limit(200)
             .execute()
         )
-        rows = [r for r in (response.data or []) if r.get("notified") is not True]
+        rows = []
+        for r in (response.data or []):
+            if r.get("notified") is True:
+                continue
+            u = (r.get("url") or "").strip().lower()
+            if u and u in sent_urls:
+                continue
+            rows.append(r)
         return [normalize_job_row(r) or r for r in rows]
     except Exception as e:
         logging.error(f"get_unnotified_matches: {e}")
@@ -474,6 +535,66 @@ def mark_jobs_notified(job_ids: list) -> bool:
         return True
     except Exception as e:
         logging.error(f"mark_jobs_notified: {e}")
+        return False
+
+
+def get_sent_job_urls(country: str, channel: str = "discord") -> set[str]:
+    """Get normalized URLs already sent for a country/channel."""
+    if not country:
+        return set()
+    try:
+        response = (
+            supabase.table("job_notifications")
+            .select("job_url")
+            .eq("country", country)
+            .eq("channel", channel)
+            .limit(5000)
+            .execute()
+        )
+        out: set[str] = set()
+        for row in (response.data or []):
+            u = (row.get("job_url") or "").strip().lower()
+            if u:
+                out.add(u)
+        return out
+    except Exception as e:
+        logging.warning(f"get_sent_job_urls: {e}")
+        return set()
+
+
+def record_job_notifications(records: list[dict]) -> bool:
+    """
+    Persist sent notifications to prevent future duplicates.
+    Expected fields per record: job_url, country, channel, sent_at?, match_score?, job_id?
+    """
+    if not records:
+        return True
+    try:
+        payload = []
+        for r in records:
+            job_url = (r.get("job_url") or "").strip()
+            country = (r.get("country") or "").strip()
+            channel = (r.get("channel") or "discord").strip()
+            if not job_url or not country:
+                continue
+            payload.append(
+                {
+                    "job_url": job_url,
+                    "country": country,
+                    "channel": channel,
+                    "sent_at": r.get("sent_at") or datetime.datetime.utcnow().isoformat(),
+                    "match_score": r.get("match_score"),
+                    "job_id": r.get("job_id"),
+                }
+            )
+        if not payload:
+            return True
+        supabase.table("job_notifications").upsert(
+            payload, on_conflict="job_url,country,channel"
+        ).execute()
+        return True
+    except Exception as e:
+        logging.error(f"record_job_notifications: {e}")
         return False
 
 def get_job_by_id(job_id: str) -> dict | None:

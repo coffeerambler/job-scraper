@@ -69,6 +69,7 @@ def notify_country(country: str) -> None:
         )
 
     ids: list[str] = []
+    sent_records: list[dict] = []
     for job in jobs_to_notify:
         jid = job.get("job_id") or job.get("id")
         if not jid:
@@ -98,12 +99,23 @@ def notify_country(country: str) -> None:
             r = requests.post(webhook, json=embed, timeout=30)
             r.raise_for_status()
             ids.append(str(jid))
+            sent_records.append(
+                {
+                    "job_url": url,
+                    "country": country,
+                    "channel": "discord",
+                    "match_score": job.get("match_score"),
+                    "job_id": str(jid),
+                }
+            )
             logging.info("Posted Discord notification for job_id=%s", jid)
         except Exception as e:
             logging.warning("Discord post failed for job_id=%s: %s", jid, e)
 
     if ids:
         supabase_utils.mark_jobs_notified(ids)
+    if sent_records:
+        supabase_utils.record_job_notifications(sent_records)
 
 
 if __name__ == "__main__":

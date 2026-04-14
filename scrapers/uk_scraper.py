@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
 from typing import Any
 import requests
 
@@ -20,10 +21,105 @@ REQUEST_TIMEOUT = getattr(config, "REQUEST_TIMEOUT", 30)
 ADZUNA_BASE = "https://api.adzuna.com/v1/api/jobs/gb/search/1"
 REED_SEARCH = "https://www.reed.co.uk/api/1.0/search"
 ARBEITNOW_API = "https://www.arbeitnow.com/api/job-board-api"
+MIN_KNOWN_SALARY_GBP = 50000
+MAX_RESULTS_PER_QUERY_PER_SOURCE = 25
+ARBEITNOW_MAX_PAGES = 1
+
+UK_INCLUDE_TERMS_STRONG = (
+    "geopolitical",
+    "political risk",
+    "china",
+    "security",
+    "national security",
+    "mandarin",
+)
+
+UK_INCLUDE_TERMS = (
+    "asia",
+    "supply",
+    "supply chain",
+    "procurement",
+    "commercial manager",
+)
+
+UK_EXCLUDE_TERMS = (
+    "product owner",
+    "product manager",
+    "retail",
+    "recruitment",
+    "recruiter",
+    "talent acquisition",
+)
 
 
 def _headers() -> dict[str, str]:
     return {"User-Agent": random.choice(user_agents.USER_AGENTS), "Accept": "application/json"}
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    s = s.replace(",", "")
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _salary_upper(salary_min: Any, salary_max: Any, salary_text: Any = None) -> float | None:
+    lo = _to_float(salary_min)
+    hi = _to_float(salary_max)
+    if hi is not None:
+        return hi
+    if lo is not None:
+        return lo
+    if salary_text:
+        nums = re.findall(r"\d+(?:,\d{3})*(?:\.\d+)?", str(salary_text))
+        if nums:
+            parsed = [float(n.replace(",", "")) for n in nums]
+            if parsed:
+                return max(parsed)
+    return None
+
+
+def _is_known_low_salary(salary_upper: float | None) -> bool:
+    return salary_upper is not None and salary_upper < MIN_KNOWN_SALARY_GBP
+
+
+def _text_blob(title: str, description: str, company: str = "") -> str:
+    return f"{title} {description} {company}".lower()
+
+
+def _is_targeted_role(title: str, description: str, company: str = "") -> bool:
+    blob = _text_blob(title, description, company)
+    if any(term in blob for term in UK_EXCLUDE_TERMS):
+        return False
+    return any(term in blob for term in UK_INCLUDE_TERMS_STRONG + UK_INCLUDE_TERMS)
+
+
+def _priority_score(title: str, description: str, company: str = "", salary_upper: float | None = None) -> int:
+    blob = _text_blob(title, description, company)
+    score = 0
+    for term in UK_INCLUDE_TERMS_STRONG:
+        if term in blob:
+            score += 3
+    for term in UK_INCLUDE_TERMS:
+        if term in blob:
+            score += 2
+    for term in UK_EXCLUDE_TERMS:
+        if term in blob:
+            score -= 4
+    if salary_upper is not None and salary_upper >= MIN_KNOWN_SALARY_GBP:
+        score += 1
+    return score
 
 
 def fetch_adzuna_jobs(query: str) -> list[dict[str, Any]]:
@@ -63,6 +159,13 @@ def fetch_adzuna_jobs(query: str) -> list[dict[str, Any]]:
         desc = str(desc).strip()
         if not url or not title:
             continue
+        salary_min = item.get("salary_min")
+        salary_max = item.get("salary_max")
+        salary_upper = _salary_upper(salary_min, salary_max)
+        if _is_known_low_salary(salary_upper):
+            continue
+        if not _is_targeted_role(title, desc, company):
+            continue
         out.append(
             {
                 "url": url,
@@ -71,8 +174,15 @@ def fetch_adzuna_jobs(query: str) -> list[dict[str, Any]]:
                 "description": desc,
                 "source": "adzuna",
                 "country": config.COUNTRY_UK,
+                "salary_min": _to_float(salary_min),
+                "salary_max": _to_float(salary_max),
+                "salary_currency": "GBP",
+                "salary_period": "year",
+                "priority_score": _priority_score(title, desc, company, salary_upper),
             }
         )
+        if len(out) >= MAX_RESULTS_PER_QUERY_PER_SOURCE:
+            break
     return out
 
 
@@ -104,6 +214,13 @@ def fetch_reed_jobs(query: str) -> list[dict[str, Any]]:
         desc = str(desc).strip()
         if not url or not title:
             continue
+        salary_min = item.get("minimumSalary")
+        salary_max = item.get("maximumSalary")
+        salary_upper = _salary_upper(salary_min, salary_max, item.get("salary"))
+        if _is_known_low_salary(salary_upper):
+            continue
+        if not _is_targeted_role(title, desc, company):
+            continue
         out.append(
             {
                 "url": url,
@@ -112,8 +229,15 @@ def fetch_reed_jobs(query: str) -> list[dict[str, Any]]:
                 "description": desc,
                 "source": "reed",
                 "country": config.COUNTRY_UK,
+                "salary_min": _to_float(salary_min),
+                "salary_max": _to_float(salary_max),
+                "salary_currency": "GBP",
+                "salary_period": "year",
+                "priority_score": _priority_score(title, desc, company, salary_upper),
             }
         )
+        if len(out) >= MAX_RESULTS_PER_QUERY_PER_SOURCE:
+            break
     return out
 
 
@@ -161,7 +285,7 @@ def _arbeitnow_is_uk(job: dict[str, Any]) -> bool:
 
 def fetch_arbeitnow_uk_jobs() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for page in (1, 2, 3):
+    for page in range(1, ARBEITNOW_MAX_PAGES + 1):
         try:
             r = requests.get(
                 ARBEITNOW_API,
@@ -191,6 +315,12 @@ def fetch_arbeitnow_uk_jobs() -> list[dict[str, Any]]:
             desc = str(desc).strip()
             if not url or not title:
                 continue
+            # Arbeitnow generally lacks structured salary; keep unknown.
+            salary_upper = _salary_upper(item.get("salary_min"), item.get("salary_max"), item.get("salary"))
+            if _is_known_low_salary(salary_upper):
+                continue
+            if not _is_targeted_role(title, desc, company):
+                continue
             out.append(
                 {
                     "url": url,
@@ -199,8 +329,15 @@ def fetch_arbeitnow_uk_jobs() -> list[dict[str, Any]]:
                     "description": desc,
                     "source": "arbeitnow",
                     "country": config.COUNTRY_UK,
+                    "salary_min": _to_float(item.get("salary_min")),
+                    "salary_max": _to_float(item.get("salary_max")),
+                    "salary_currency": "GBP" if salary_upper is not None else None,
+                    "salary_period": "year" if salary_upper is not None else None,
+                    "priority_score": _priority_score(title, desc, company, salary_upper),
                 }
             )
+            if len(out) >= MAX_RESULTS_PER_QUERY_PER_SOURCE:
+                return out
     return out
 
 

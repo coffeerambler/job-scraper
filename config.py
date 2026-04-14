@@ -46,6 +46,9 @@ CAREERS_FUTURE_SEARCH_EMPLOYMENT_TYPES = ["Full Time"]
 # --- Processing Limits ---
 SCRAPING_SOURCES = ["linkedin"] # "linkedin", "careers_future"
 JOBS_TO_SCORE_PER_RUN = 5
+# Country-specific daily LLM scoring caps (used by `python score_jobs.py uk|taiwan`).
+JOBS_TO_SCORE_PER_RUN_UK = 10
+JOBS_TO_SCORE_PER_RUN_TAIWAN = 10
 JOBS_TO_CUSTOMIZE_PER_RUN = 1
 MAX_JOBS_PER_SEARCH = {
     "linkedin": 2,

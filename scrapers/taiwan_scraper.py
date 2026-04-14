@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import random
 import re
+import json
 from typing import Any
 from urllib.parse import quote_plus, urljoin
 
@@ -24,6 +25,36 @@ MEET_JOBS_API = "https://meet.jobs/api/v1/jobs"
 TEALIT_LIST = "https://www.tealit.com/job_listings/"
 YOURATOR_BASE = "https://www.yourator.co/jobs"
 AREA_TAIPEI = "6001001000"
+JOBS_104_API = "https://www.104.com.tw/jobs/search/api/jobs"
+
+TAIWAN_INCLUDE_TERMS_STRONG = (
+    "geopolitical",
+    "political risk",
+    "security",
+    "national security",
+    "supply chain manager",
+    "semiconductor",
+    "wind power",
+    "offshore wind",
+)
+
+TAIWAN_INCLUDE_TERMS = (
+    "asia",
+    "supply",
+    "supply chain",
+    "procurement",
+    "commercial manager",
+    "operations manager",
+    "risk",
+    "strategy",
+)
+
+TAIWAN_EXCLUDE_TERMS = (
+    "retail",
+    "recruitment",
+    "recruiter",
+    "talent acquisition",
+)
 
 
 def _headers() -> dict[str, str]:
@@ -34,17 +65,106 @@ def _headers() -> dict[str, str]:
     }
 
 
+def _text_blob(title: str, description: str, company: str = "") -> str:
+    return f"{title} {description} {company}".lower()
+
+
+def _is_targeted_role(title: str, description: str, company: str = "") -> bool:
+    # Hard block: exclude all teacher roles by title.
+    if re.search(r"\bteacher\b", title.lower()):
+        return False
+    blob = _text_blob(title, description, company)
+    if any(term in blob for term in TAIWAN_EXCLUDE_TERMS):
+        return False
+    return any(term in blob for term in TAIWAN_INCLUDE_TERMS_STRONG + TAIWAN_INCLUDE_TERMS)
+
+
+def _priority_score(title: str, description: str, company: str = "") -> int:
+    blob = _text_blob(title, description, company)
+    score = 0
+    for term in TAIWAN_INCLUDE_TERMS_STRONG:
+        if term in blob:
+            score += 3
+    for term in TAIWAN_INCLUDE_TERMS:
+        if term in blob:
+            score += 2
+    for term in TAIWAN_EXCLUDE_TERMS:
+        if term in blob:
+            score -= 4
+    return score
+
+
+def _extract_text_from_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) Preferred metadata fields
+    for selector, attr in (
+        ('meta[property="og:description"]', "content"),
+        ('meta[name="description"]', "content"),
+    ):
+        tag = soup.select_one(selector)
+        if tag and tag.get(attr):
+            text = str(tag.get(attr)).strip()
+            if len(text) > 40:
+                return text
+
+    # 2) JSON-LD description
+    for s in soup.select('script[type="application/ld+json"]'):
+        raw = s.string or s.get_text() or ""
+        if not raw.strip():
+            continue
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            continue
+        candidates = payload if isinstance(payload, list) else [payload]
+        for c in candidates:
+            if isinstance(c, dict):
+                d = c.get("description")
+                if isinstance(d, str) and len(d.strip()) > 40:
+                    return d.strip()
+
+    # 3) Fallback body text (coarse)
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = soup.get_text(" ", strip=True)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:2000]
+
+
+def _enrich_description_from_url(url: str, current_desc: str) -> str:
+    """Fetch job page and extract a readable description when source payload is empty."""
+    if current_desc and len(current_desc.strip()) >= 40:
+        return current_desc.strip()
+    if not url:
+        return current_desc or ""
+    try:
+        r = requests.get(url, headers=_headers(), timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        extracted = _extract_text_from_html(r.text)
+        if extracted and len(extracted.strip()) >= 40:
+            return extracted.strip()
+    except Exception as e:
+        logging.debug("Description enrichment failed for %s: %s", url, e)
+    return current_desc or ""
+
+
 def fetch_meet_jobs() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     try:
         r = requests.get(
             MEET_JOBS_API,
             params={"location": "taiwan"},
-            headers=_headers(),
+            headers={**_headers(), "Accept": "application/json"},
             timeout=REQUEST_TIMEOUT,
         )
         r.raise_for_status()
-        data = r.json()
+        try:
+            data = r.json()
+        except Exception:
+            # Occasionally returns non-JSON pages (e.g., anti-bot/challenge).
+            logging.warning("Meet.jobs API returned non-JSON response (status=%s).", r.status_code)
+            return out
     except Exception as e:
         logging.warning("Meet.jobs API failed: %s", e)
         return out
@@ -65,8 +185,11 @@ def fetch_meet_jobs() -> list[dict[str, Any]]:
         desc = str(desc).strip()
         if not url or not title:
             continue
+        if not _is_targeted_role(title, desc, company):
+            continue
         if not str(url).startswith("http"):
             url = urljoin("https://meet.jobs/", str(url).lstrip("/"))
+        desc = _enrich_description_from_url(str(url), desc)
         out.append(
             {
                 "url": url,
@@ -75,6 +198,7 @@ def fetch_meet_jobs() -> list[dict[str, Any]]:
                 "description": desc,
                 "source": "meet.jobs",
                 "country": config.COUNTRY_TAIWAN,
+                "priority_score": _priority_score(title, desc, company or "Unknown"),
             }
         )
     return out
@@ -82,38 +206,56 @@ def fetch_meet_jobs() -> list[dict[str, Any]]:
 
 def fetch_tealit() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    try:
-        r = requests.get(TEALIT_LIST, headers=_headers(), timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-    except Exception as e:
-        logging.warning("Tealit scrape failed: %s", e)
-        return out
+    candidate_pages = [
+        TEALIT_LIST,
+        "https://www.tealit.com/jobs/",
+        "https://www.tealit.com/",
+    ]
+    for page in candidate_pages:
+        try:
+            r = requests.get(page, headers=_headers(), timeout=REQUEST_TIMEOUT)
+            if r.status_code >= 400:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+        except Exception:
+            continue
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        text = a.get_text(" ", strip=True)
-        if not text or len(text) < 4:
-            continue
-        if "/job" not in href.lower() and "job_listing" not in href.lower() and "position" not in href.lower():
-            continue
-        if href.startswith("/"):
-            href = urljoin("https://www.tealit.com/", href)
-        if not href.startswith("http"):
-            continue
-        out.append(
-            {
-                "url": href,
-                "title": text[:500],
-                "company": "Unknown",
-                "description": "",
-                "source": "tealit",
-                "country": config.COUNTRY_TAIWAN,
-            }
-        )
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            text = a.get_text(" ", strip=True)
+            if not text or len(text) < 4:
+                continue
+            href_l = href.lower()
+            if (
+                "/job" not in href_l
+                and "job_listing" not in href_l
+                and "position" not in href_l
+                and "tealit.com/job" not in href_l
+            ):
+                continue
+            if href.startswith("/"):
+                href = urljoin("https://www.tealit.com/", href)
+            if not href.startswith("http"):
+                continue
+            if not _is_targeted_role(text, "", "Unknown"):
+                continue
+            desc = _enrich_description_from_url(href, "")
+            out.append(
+                {
+                    "url": href,
+                    "title": text[:500],
+                    "company": "Unknown",
+                    "description": desc,
+                    "source": "tealit",
+                    "country": config.COUNTRY_TAIWAN,
+                    "priority_score": _priority_score(text[:500], "", "Unknown"),
+                }
+            )
+        if out:
+            break
 
     if not out:
-        logging.warning("Tealit: no job links parsed (layout may have changed).")
+        logging.warning("Tealit: no job links parsed (layout/URL likely changed).")
     return out
 
 
@@ -127,32 +269,63 @@ def fetch_yourator() -> list[dict[str, Any]]:
             timeout=REQUEST_TIMEOUT,
         )
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+        html = r.text
+        soup = BeautifulSoup(html, "html.parser")
     except Exception as e:
         logging.warning("Yourator scrape failed: %s", e)
         return out
 
-    for a in soup.select('a[href*="/jobs/"]'):
+    for a in soup.select('a[href*="/jobs/"], a[href*="/job/"], a[href*="/companies/"]'):
         href = a.get("href", "").strip()
-        if not href or "/jobs/" not in href:
+        if not href:
             continue
-        if href.count("/") < 3:
+        href_l = href.lower()
+        if "/jobs/" not in href_l and "/job/" not in href_l:
             continue
         title = a.get_text(" ", strip=True)
         if not title:
             continue
         if href.startswith("/"):
             href = urljoin("https://www.yourator.co/", href)
+        if not _is_targeted_role(title, "", "Unknown"):
+            continue
+        desc = _enrich_description_from_url(href, "")
         out.append(
             {
                 "url": href,
                 "title": title[:500],
                 "company": "Unknown",
-                "description": "",
+                "description": desc,
                 "source": "yourator",
                 "country": config.COUNTRY_TAIWAN,
+                "priority_score": _priority_score(title[:500], "", "Unknown"),
             }
         )
+
+    # Fallback: parse Next.js payload for job cards/links
+    if not out:
+        script = soup.find("script", id="__NEXT_DATA__")
+        if script and script.string:
+            try:
+                payload = json.loads(script.string)
+                payload_text = json.dumps(payload)
+                for m in re.finditer(r'"url"\s*:\s*"(\/jobs\/[^"]+)"', payload_text):
+                    rel = m.group(1).encode("utf-8").decode("unicode_escape")
+                    out.append(
+                        {
+                            "url": urljoin("https://www.yourator.co/", rel),
+                            "title": "Yourator job",
+                            "company": "Unknown",
+                            "description": _enrich_description_from_url(
+                                urljoin("https://www.yourator.co/", rel), ""
+                            ),
+                            "source": "yourator",
+                            "country": config.COUNTRY_TAIWAN,
+                            "priority_score": _priority_score("Yourator job", "", "Unknown"),
+                        }
+                    )
+            except Exception:
+                pass
 
     seen: set[str] = set()
     deduped: list[dict[str, Any]] = []
@@ -170,44 +343,70 @@ def fetch_yourator() -> list[dict[str, Any]]:
 
 def fetch_104_english() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    urls = [
-        f"https://www.104.com.tw/jobs/search/?keyword={quote_plus('english')}&area={AREA_TAIPEI}",
-    ]
-    for kw in config.TAIWAN_SEARCH_QUERIES:
-        urls.append(
-            f"https://www.104.com.tw/jobs/search/?keyword={quote_plus(kw)}&area={AREA_TAIPEI}"
-        )
-
-    for page_url in urls:
+    queries = ["english", *config.TAIWAN_SEARCH_QUERIES]
+    for kw in queries:
         try:
-            r = requests.get(page_url, headers=_headers(), timeout=REQUEST_TIMEOUT)
+            r = requests.get(
+                JOBS_104_API,
+                params={
+                    "keyword": kw,
+                    "area": AREA_TAIPEI,
+                    "order": 15,  # latest
+                    "page": 1,
+                    "mode": "s",
+                },
+                headers={
+                    **_headers(),
+                    "Accept": "application/json, text/plain, */*",
+                    "Referer": f"https://www.104.com.tw/jobs/search/?keyword={quote_plus(kw)}&area={AREA_TAIPEI}",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
             r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
+            data = r.json()
         except Exception as e:
-            logging.warning("104 scrape failed for %s: %s", page_url[:80], e)
+            logging.warning("104 API failed for %r: %s", kw, e)
             continue
 
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "job" not in href.lower():
+        rows = data.get("data") if isinstance(data, dict) else None
+        rows = rows if isinstance(rows, list) else []
+        for item in rows:
+            if not isinstance(item, dict):
                 continue
-            if not re.search(r"104\.com\.tw/job", href):
-                continue
-            title = a.get_text(" ", strip=True)
-            if not title:
-                continue
+            job_no = item.get("jobNo")
+            link = item.get("link", {}) if isinstance(item.get("link"), dict) else {}
+            href = link.get("job") or (f"https://www.104.com.tw/job/{job_no}" if job_no else "")
             if href.startswith("//"):
                 href = "https:" + href
-            elif href.startswith("/"):
-                href = urljoin("https://www.104.com.tw/", href)
+            if not href.startswith("http"):
+                continue
+
+            title_obj = item.get("jobName")
+            title = title_obj.get("label") if isinstance(title_obj, dict) else str(title_obj or "")
+            title = title.strip()
+            if not title:
+                continue
+
+            company_obj = item.get("custName")
+            company = company_obj.get("label") if isinstance(company_obj, dict) else str(company_obj or "")
+            company = company.strip() or "Unknown"
+
+            desc = ""
+            if isinstance(item.get("jobDescription"), str):
+                desc = item.get("jobDescription", "").strip()
+            desc = _enrich_description_from_url(href, desc)
+            if not _is_targeted_role(title, desc, company):
+                continue
+
             out.append(
                 {
                     "url": href,
                     "title": title[:500],
-                    "company": "Unknown",
-                    "description": "",
+                    "company": company,
+                    "description": desc,
                     "source": "104",
                     "country": config.COUNTRY_TAIWAN,
+                    "priority_score": _priority_score(title[:500], desc, company),
                 }
             )
 
