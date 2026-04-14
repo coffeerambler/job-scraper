@@ -494,7 +494,13 @@ def update_job_score(job_id: str, score: int, reason: str) -> bool:
 
 
 def get_unnotified_matches(country: str, threshold: int) -> list:
-    """Get high-scoring unnotified jobs for a country (match_score strictly above threshold)."""
+    """
+    Get candidate jobs for notifications.
+    Priority:
+      - scored jobs with match_score > threshold
+      - fallback unscored jobs with positive priority_score
+    Excludes already-notified and already-sent URLs.
+    """
     if not country:
         return []
     try:
@@ -503,12 +509,12 @@ def get_unnotified_matches(country: str, threshold: int) -> list:
         response = (
             supabase.table(config.SUPABASE_TABLE_NAME)
             .select(
-                f"{pk}, title, company, description, url, source, match_score, match_reason, scraped_at, notified"
+                f"{pk}, title, company, description, url, source, match_score, priority_score, match_reason, scraped_at, notified"
             )
             .eq("country", country)
-            .gt("match_score", threshold)
-            .order("match_score", desc=True)
-            .limit(200)
+            .eq("is_active", True)
+            .eq("status", "new")
+            .limit(600)
             .execute()
         )
         rows = []
@@ -518,6 +524,14 @@ def get_unnotified_matches(country: str, threshold: int) -> list:
             u = (r.get("url") or "").strip().lower()
             if u and u in sent_urls:
                 continue
+            ms = r.get("match_score")
+            ps = r.get("priority_score") or 0
+            if ms is not None:
+                if ms <= threshold:
+                    continue
+            else:
+                if ps <= 0:
+                    continue
             rows.append(r)
         return [normalize_job_row(r) or r for r in rows]
     except Exception as e:

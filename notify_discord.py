@@ -56,8 +56,9 @@ def notify_country(country: str) -> None:
     jobs_sorted = sorted(
         jobs,
         key=lambda j: (
-            j.get("match_score") is None,
+            j.get("match_score") is None,  # scored jobs first
             -(j.get("match_score") or 0),
+            -(j.get("priority_score") or 0),
         ),
     )
     jobs_to_notify = jobs_sorted[:cap]
@@ -88,7 +89,15 @@ def notify_country(country: str) -> None:
                     "color": 5814783,
                     "fields": [
                         {"name": "Company", "value": (job.get("company") or "—")[:1024], "inline": True},
-                        {"name": "Score", "value": f"{job.get('match_score')}/10", "inline": True},
+                        {
+                            "name": "Score",
+                            "value": (
+                                f"{job.get('match_score')}/10"
+                                if job.get("match_score") is not None
+                                else f"Priority {job.get('priority_score') or 0}"
+                            ),
+                            "inline": True,
+                        },
                         {"name": "Source", "value": (job.get("source") or "—")[:1024], "inline": True},
                     ],
                     "footer": {"text": f"Scraped {_format_scraped_at(job.get('scraped_at'))}"},
