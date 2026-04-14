@@ -783,7 +783,7 @@ def save_base_resume(resume_data: dict) -> bool:
         if existing_rows:
             existing_id = existing_rows[0].get("id")
             logging.info(f"Updating existing base resume row in '{table_name}' (id={existing_id})...")
-            response = (
+            (
                 supabase.table(table_name)
                 .update({"resume_data": resume_data})
                 .eq("id", existing_id)
@@ -791,15 +791,25 @@ def save_base_resume(resume_data: dict) -> bool:
             )
         else:
             logging.info(f"No existing base resume row found; inserting into '{table_name}'...")
-            response = supabase.table(table_name).insert({
+            supabase.table(table_name).insert({
                 "resume_data": resume_data
             }).execute()
 
-        if response.data and len(response.data) > 0:
+        # Some PostgREST configurations return minimal payload for writes.
+        # Verify success by reading the latest row after the write.
+        verify_response = (
+            supabase.table(table_name)
+            .select("id,resume_data")
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        verify_rows = verify_response.data or []
+        if verify_rows and verify_rows[0].get("resume_data"):
             logging.info(f"Successfully saved base resume to '{table_name}'.")
             return True
         else:
-            logging.warning(f"Base resume write returned no data. Response: {response}")
+            logging.warning("Base resume write completed but verification found no row.")
             return False
 
     except Exception as e:
