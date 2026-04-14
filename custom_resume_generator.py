@@ -21,6 +21,133 @@ import os
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- LLM Personalization Function ---
+_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it",
+    "of", "on", "or", "that", "the", "to", "with", "you", "your", "this", "these", "those",
+}
+
+
+def _tokenize(text: str) -> set[str]:
+    if not text:
+        return set()
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9\-/+]*", text.lower())
+    return {t for t in tokens if t not in _STOPWORDS and len(t) >= 3}
+
+
+def _job_terms(job_details: Dict[str, Any]) -> set[str]:
+    parts = [
+        str(job_details.get("job_title", "") or ""),
+        str(job_details.get("company", "") or ""),
+        str(job_details.get("description", "") or ""),
+        str(job_details.get("level", "") or ""),
+    ]
+    return _tokenize(" ".join(parts))
+
+
+def _relevance_score(text: str, terms: set[str]) -> int:
+    if not text or not terms:
+        return 0
+    content_tokens = _tokenize(text)
+    overlap = len(content_tokens & terms)
+    # Small length bonus helps pick richer, still-relevant items first.
+    return overlap * 10 + min(len(content_tokens), 30)
+
+
+def _truncate_words(text: str, max_words: int) -> str:
+    if not text:
+        return ""
+    words = text.split()
+    if len(words) <= max_words:
+        return text.strip()
+    return " ".join(words[:max_words]).strip().rstrip(",;:") + "."
+
+
+def _to_bullets(text: str, max_bullets: int, max_words_per_bullet: int) -> str:
+    if not text:
+        return ""
+    lines = [ln.strip().lstrip("-• ").strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        raw = re.split(r"(?<=[.!?])\s+", text.strip())
+        lines = [s.strip().lstrip("-• ").strip() for s in raw if s.strip()]
+    compacted = []
+    for ln in lines:
+        if len(compacted) >= max_bullets:
+            break
+        compacted.append(_truncate_words(ln, max_words_per_bullet))
+    return "\n".join(compacted)
+
+
+def _post_process_resume_for_fit(personalized: Resume, job_details: Dict[str, Any]) -> Resume:
+    """
+    Enforce deterministic selectivity after LLM output:
+    - summary concise
+    - skills <= 10 and relevance-first
+    - experience ordered by relevance; low relevance collapsed to header-only
+    - projects ordered by relevance and capped
+    """
+    tuned = personalized.model_copy(deep=True)
+    terms = _job_terms(job_details)
+
+    tuned.summary = _truncate_words(tuned.summary or "", max_words=90)
+
+    skills = [s.strip() for s in (tuned.skills or []) if s and s.strip() and s.strip().upper() != "NA"]
+    skills_scored = sorted(
+        ((s, _relevance_score(s, terms)) for s in skills),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    seen = set()
+    capped_skills = []
+    for skill, _ in skills_scored:
+        key = skill.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        capped_skills.append(skill)
+        if len(capped_skills) >= 10:
+            break
+    tuned.skills = capped_skills
+
+    experiences = tuned.experience or []
+    scored_exp = []
+    for exp in experiences:
+        exp_text = " ".join([exp.job_title or "", exp.company or "", exp.description or ""])
+        scored_exp.append((exp, _relevance_score(exp_text, terms)))
+    scored_exp.sort(key=lambda x: x[1], reverse=True)
+
+    tuned_experience: List[Experience] = []
+    max_detailed_roles = getattr(config, "CV_MAX_DETAILED_ROLES", 4)
+    for idx, (exp, score) in enumerate(scored_exp):
+        exp_item = exp.model_copy(deep=True)
+        if idx < max_detailed_roles and score > 0:
+            exp_item.description = _to_bullets(exp_item.description or "", max_bullets=3, max_words_per_bullet=26)
+        else:
+            # Keep title/company/dates, remove detail for low relevance.
+            exp_item.description = ""
+        tuned_experience.append(exp_item)
+    tuned.experience = tuned_experience
+
+    projects = tuned.projects or []
+    scored_projects = []
+    for proj in projects:
+        proj_text = " ".join([proj.name or "", " ".join(proj.technologies or []), proj.description or ""])
+        scored_projects.append((proj, _relevance_score(proj_text, terms)))
+    scored_projects.sort(key=lambda x: x[1], reverse=True)
+
+    max_projects = getattr(config, "CV_MAX_PROJECTS", 2)
+    tuned_projects: List[Project] = []
+    for proj, score in scored_projects[:max_projects]:
+        proj_item = proj.model_copy(deep=True)
+        if score > 0:
+            proj_item.description = _to_bullets(proj_item.description or "", max_bullets=2, max_words_per_bullet=22)
+        else:
+            proj_item.description = ""
+        tuned_projects.append(proj_item)
+    tuned.projects = tuned_projects
+
+    return tuned
+
+
 def extract_json_from_text(text: str) -> str:
     """
     Extracts and returns the first valid JSON string found in the text.
@@ -207,7 +334,7 @@ async def personalize_section_with_llm(
 
         **2. Select and Refine for the Target Job and Conciseness:**
         - From your temporary list of the candidate's *actual, explicitly mentioned* skills, select only those that are most relevant to the 'Target Job Description'.
-        - Your final output MUST be a CONCISE list. **This list MUST contain between 5 and 15 skills.**
+        - Your final output MUST be a CONCISE list. **This list MUST contain between 5 and 10 skills.**
         - If, after strictly following all rules, you identify fewer than 5 relevant skills that meet all criteria, then list only those. Do not add skills just to meet the 5-skill minimum if they are not genuinely present and relevant.
         - Prioritize skills that are directly mentioned in the 'Target Job Description' AND are confirmed to be in the candidate's actual, explicitly written skills.
         - Avoid redundancy. If a skill is a more general version of another already included (e.g., "Cloud Computing" vs. "AWS"), prefer the more specific one if relevant and explicitly mentioned, or the one that best matches the job description.
@@ -421,7 +548,10 @@ async def process_job(
             logging.info(f"--- Aborting PDF generation and further processing for job_id: {job_id} due to validation failure. ---")
             return 
 
-        # 2. Save customized resume (with or without PDF in this step)
+        # 2. Enforce selective, concise structure for 2-page target.
+        personalized_resume_data = _post_process_resume_for_fit(personalized_resume_data, job_details)
+
+        # 3. Save customized resume (with or without PDF in this step)
         if skip_pdf:
             logging.info(f"Saving customized resume JSON only for job_id: {job_id} (PDF via pdf_generator).")
             customized_resume_id = supabase_utils.save_customized_resume(personalized_resume_data, None)

@@ -550,10 +550,31 @@ def create_resume_pdf(resume_data: Resume) -> bytes:
         pdf_bytes = _build_resume_pdf_bytes(resume_data, 10.0)
         n2 = _pdf_page_count(pdf_bytes)
         if n2 > 2:
-            logging.warning(
-                "Resume PDF still has %s pages after reducing base font to 10pt (target max 2 pages A4).",
-                n2,
-            )
+            logging.info("PDF still %s pages at 10pt; applying compact fallback.", n2)
+            compact = resume_data.model_copy(deep=True)
+            # Keep concise summary and a smaller set of high-signal sections.
+            if compact.summary:
+                compact.summary = " ".join(compact.summary.split()[:55]).strip().rstrip(",;:") + "."
+            compact.skills = (compact.skills or [])[:8]
+            compact.experience = (compact.experience or [])[:6]
+            for i, exp in enumerate(compact.experience):
+                # Only keep detail on top few roles; preserve chronology headers for the rest.
+                if i >= 3:
+                    exp.description = ""
+                elif exp.description:
+                    lines = [ln.strip().lstrip("-• ").strip() for ln in exp.description.splitlines() if ln.strip()]
+                    exp.description = "\n".join(lines[:2])
+            compact.projects = (compact.projects or [])[:1]
+            if compact.projects and compact.projects[0].description:
+                lines = [ln.strip().lstrip("-• ").strip() for ln in compact.projects[0].description.splitlines() if ln.strip()]
+                compact.projects[0].description = "\n".join(lines[:2])
+            pdf_bytes = _build_resume_pdf_bytes(compact, 10.0)
+            n3 = _pdf_page_count(pdf_bytes)
+            if n3 > 2:
+                logging.warning(
+                    "Resume PDF remains %s pages after compact fallback (target max 2 pages A4).",
+                    n3,
+                )
     return pdf_bytes
 
 
