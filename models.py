@@ -68,5 +68,9 @@ class ValidationResponse(BaseModel):
     is_valid: bool
     reason: str
 
+class MatchScoreOutput(BaseModel):
+    score: int
+    reason: str
+
 class Config:
     extra = 'allow'

@@ -1,7 +1,8 @@
 import time
 import json
 import logging
-from typing import List, Optional, Dict, Any
+import sys
+from typing import List, Optional, Dict, Any, Tuple
 import requests
 import io
 import pdfplumber
@@ -10,6 +11,7 @@ import os
 import config
 import supabase_utils
 from llm_client import primary_client
+from models import MatchScoreOutput
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -159,6 +161,125 @@ def get_resume_score_from_ai(resume_text: str, job_details: Dict[str, Any]) -> O
         return None
 
 
+def get_country_match_from_ai(
+    resume_text: str, job_details: Dict[str, Any], country: str
+) -> Optional[Tuple[int, str]]:
+    """
+    Country-aware match score 1–10 with short reason. Returns (score, reason) or None.
+    """
+    if not resume_text or not job_details or not job_details.get("description"):
+        logging.warning(
+            "Missing resume or job description for job_id %s; skipping match scoring.",
+            job_details.get("job_id"),
+        )
+        return None
+
+    job_company = job_details.get("company", "N/A")
+    job_title = job_details.get("job_title", "N/A")
+    job_description = job_details.get("description", "N/A")
+    job_level = job_details.get("level", "N/A")
+
+    country_extra = ""
+    if country == config.COUNTRY_TAIWAN:
+        country_extra = """
+Additional criteria for Taiwan roles (weigh these in your score and reason):
+- Whether the role is English-language or clearly English-friendly (work language, JD language, multinational norms).
+- Whether the employer appears to be a multinational / regional HQ vs a purely local Taiwanese company — multinational or global-facing teams are a better fit for English-speaking candidates.
+"""
+    elif country == config.COUNTRY_UK:
+        country_extra = """
+Additional criteria for UK roles (weigh these in your score and reason):
+- Seniority match: the candidate has senior experience and UK Civil Service Grade 6–7 (or equivalent) seniority — penalize clear under/over-level mismatches.
+"""
+
+    user_prompt = f"""You are evaluating how well the candidate’s resume fits the job.
+
+Return a JSON object with exactly two keys: "score" (integer 1–10 inclusive) and "reason" (one short paragraph, plain text).
+
+Scoring rubric (1 = poor fit, 10 = excellent fit):
+- Alignment of skills and experience with the role.
+- Relevance of sector and responsibilities.
+- Realistic seniority and scope vs the job description.
+
+{country_extra}
+
+--- RESUME ---
+{resume_text}
+--- END RESUME ---
+
+--- JOB ---
+Title: {job_title}
+Company: {job_company}
+Level (if known): {job_level}
+
+{job_description}
+--- END JOB ---
+"""
+
+    system_prompt = """You output only structured data matching the schema: an integer score from 1 to 10 and a concise reason.
+Do not invent resume facts. Base the score only on the provided resume and job description."""
+
+    try:
+        raw = primary_client.generate_content(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            temperature=0.3,
+            response_format=MatchScoreOutput,
+        )
+        parsed = MatchScoreOutput.model_validate_json(raw)
+        if parsed.score < 1 or parsed.score > 10:
+            logging.warning("Match score out of 1–10 range for job_id %s: %s", job_details.get("job_id"), parsed.score)
+            return None
+        return parsed.score, (parsed.reason or "").strip()
+    except Exception as e:
+        logging.error("Country match scoring failed for job_id %s: %s", job_details.get("job_id"), e)
+        return None
+
+
+def score_jobs_for_country(country: str) -> None:
+    """Score unscored jobs for uk/taiwan using match_score (1–10) and match_reason."""
+    logging.info("--- Match scoring for country: %s ---", country)
+    resume_path = getattr(config, "BASE_RESUME_PATH", "resume.json")
+    default_resume_data = supabase_utils.get_base_resume()
+    if default_resume_data:
+        logging.info("Loaded base resume from Supabase.")
+    elif os.path.exists(resume_path):
+        try:
+            with open(resume_path, "r", encoding="utf-8") as f:
+                default_resume_data = json.load(f)
+        except Exception as e:
+            logging.error("Could not read local resume %s: %s", resume_path, e)
+            default_resume_data = None
+    else:
+        default_resume_data = None
+
+    if not default_resume_data:
+        logging.error("No base resume available; aborting country scoring.")
+        return
+
+    resume_text = format_resume_to_text(default_resume_data)
+    limit = max(1, getattr(config, "JOBS_TO_SCORE_PER_RUN", 5))
+    jobs = supabase_utils.get_unscored_jobs(country, limit=limit)
+    if not jobs:
+        logging.info("No unscored jobs for country %s.", country)
+        return
+
+    ok = 0
+    for i, job in enumerate(jobs):
+        job_id = job.get("job_id")
+        if not job_id:
+            continue
+        logging.info("Scoring %s/%s job_id=%s", i + 1, len(jobs), job_id)
+        result = get_country_match_from_ai(resume_text, job, country)
+        if result:
+            score, reason = result
+            if supabase_utils.update_job_score(str(job_id), score, reason):
+                ok += 1
+        if i < len(jobs) - 1:
+            time.sleep(config.LLM_REQUEST_DELAY_SECONDS)
+    logging.info("Country scoring finished: %s/%s jobs updated.", ok, len(jobs))
+
+
 def extract_text_from_pdf_url(pdf_url: str) -> Optional[str]:
     """
     Downloads a PDF from a URL and extracts text from it.
@@ -253,7 +374,7 @@ def rescore_jobs_with_custom_resume():
         score = get_resume_score_from_ai(custom_resume_text, job)
 
         if score is not None:
-            if supabase_utils.update_job_score(job_id, score, resume_score_stage="custom"):
+            if supabase_utils.update_job_resume_score(job_id, score, resume_score_stage="custom"):
                 successful_rescores += 1
             else:
                 failed_rescores += 1 
@@ -325,7 +446,7 @@ def main():
                 score = get_resume_score_from_ai(default_resume_text, job)
 
                 if score is not None:
-                    if supabase_utils.update_job_score(job_id, score, resume_score_stage="initial"):
+                    if supabase_utils.update_job_resume_score(job_id, score, resume_score_stage="initial"):
                         successful_initial_scores += 1
                     else:
                         failed_initial_scores += 1
@@ -355,5 +476,7 @@ if __name__ == "__main__":
         logging.error("LLM_API_KEY environment variable not set. (Also accepts GEMINI_API_KEY / GEMINI_FIRST_API_KEY)")
     elif not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
         logging.error("Supabase URL or Key environment variable not set.")
+    elif len(sys.argv) >= 2 and sys.argv[1] in (config.COUNTRY_UK, config.COUNTRY_TAIWAN):
+        score_jobs_for_country(sys.argv[1])
     else:
         main()

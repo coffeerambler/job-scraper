@@ -356,17 +356,19 @@ def process_linkedin_query(search_query: str, location: str, limit: int = None) 
 
 
     logging.info("\n--- Starting Filtering Step: Checking against Supabase ---")
-    job_ids_set, company_title_set = supabase_utils.get_existing_jobs_from_supabase()
+    job_ids_set, company_title_set, existing_urls = supabase_utils.get_existing_jobs_from_supabase()
+
+    def _linkedin_listing_url(jid: str) -> str:
+        return f"https://www.linkedin.com/jobs/view/{jid}".strip().lower()
 
     new_job_ids_to_process = [
-        str(job_id) for job_id in unique_linkedin_job_ids 
-        if str(job_id) not in job_ids_set
+        str(job_id) for job_id in unique_linkedin_job_ids
+        if _linkedin_listing_url(str(job_id)) not in existing_urls
     ]
-
 
     logging.info(f"Found {len(unique_linkedin_job_ids)} unique scraped IDs.")
 
-    logging.info(f"Found {len(job_ids_set)} existing IDs in Supabase.")
+    logging.info(f"Found {len(job_ids_set)} existing rows and {len(existing_urls)} URLs in Supabase.")
 
     logging.info(f"Identified {len(new_job_ids_to_process)} new job IDs to fetch details for.")
 
@@ -610,13 +612,19 @@ def process_careers_future_query(search_query: str, limit: int = None) -> list:
     # 2. Fetch existing job identifiers from Supabase
     logging.info("Phase 2: Fetching existing job identifiers from Supabase...")
     try:
-        job_ids_set_supabase, company_title_set_supabase = supabase_utils.get_existing_jobs_from_supabase()
-        logging.info(f"Phase 2: Supabase returned {len(job_ids_set_supabase)} existing IDs and {len(company_title_set_supabase)} company/title pairs.")
+        job_ids_set_supabase, company_title_set_supabase, existing_urls_supabase = (
+            supabase_utils.get_existing_jobs_from_supabase()
+        )
+        logging.info(
+            f"Phase 2: Supabase returned {len(job_ids_set_supabase)} IDs, "
+            f"{len(company_title_set_supabase)} company/title pairs, {len(existing_urls_supabase)} URLs."
+        )
     except Exception as e:
         logging.error(f"Failed to fetch existing jobs from Supabase: {e}")
         logging.warning("Proceeding without Supabase data; all fetched jobs will be considered new.")
         job_ids_set_supabase = set()
         company_title_set_supabase = set()
+        existing_urls_supabase = set()
 
     # 3. Filter the fetched jobs
     logging.info("Phase 3: Filtering fetched jobs against Supabase data...")
@@ -630,12 +638,12 @@ def process_careers_future_query(search_query: str, limit: int = None) -> list:
             continue
 
         job_uuid = str(job_item.get('uuid'))
-        
-        # Check 1: Does the UUID already exist in Supabase?
-        if job_uuid and job_uuid in job_ids_set_supabase:
-            logging.debug(f"Skipping job (ID exists in Supabase): UUID='{job_uuid}', Title='{job_item.get('title', 'N/A')}'")
+        cf_url = f"https://www.mycareersfuture.gov.sg/job/{job_uuid}".strip().lower()
+
+        if job_uuid and cf_url in existing_urls_supabase:
+            logging.debug(f"Skipping job (URL already in Supabase): UUID='{job_uuid}', Title='{job_item.get('title', 'N/A')}'")
             skipped_by_id_count += 1
-            continue # Skip this job
+            continue
 
         # Prepare for Check 2: Company & Title combination
         company_name = _get_careers_future_job_company_name(job_item)

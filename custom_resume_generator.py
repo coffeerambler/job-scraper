@@ -1,4 +1,5 @@
 import logging
+import sys
 import io # Import io
 import supabase_utils
 import config # Assuming config holds necessary configurations like a default email
@@ -108,6 +109,13 @@ async def personalize_section_with_llm(
     system_prompt = f"""
     You are an expert resume writer and a precise JSON generation assistant.
     Your primary function is to enhance specified sections of a resume to better align with a target job description, based on the provided resume context and original section content.
+
+    **TARGET JOB TAILORING (apply to all sections):**
+    - Select only experience directly relevant to this specific job description.
+    - The finished CV must fit within a maximum of 2 pages A4 at 11pt font — omit or summarise older or less relevant roles to stay within that length.
+    - Use a maximum of 4 bullet points per role in experience (and keep project descriptions similarly concise).
+    - Mirror keywords from the job description where they accurately reflect the candidate's real experience.
+    - Do not fabricate anything not present in the source resume materials.
 
     **CRITICAL OUTPUT REQUIREMENTS:**
     1.  You MUST ALWAYS output a single, valid JSON object.
@@ -334,14 +342,20 @@ async def validate_customization(
 
 
 # --- Main Processing Logic ---
-async def process_job(job_details: Dict[str, Any], base_resume_details: Resume):
+async def process_job(
+    job_details: Dict[str, Any],
+    base_resume_details: Resume,
+    skip_pdf: bool = False,
+):
     """
-    Processes a single job: personalizes resume, generates PDF, uploads, updates status.
+    Processes a single job: personalizes resume, optionally generates PDF in this step.
+    When skip_pdf is True, only the customized_resumes row and job link are saved; run pdf_generator separately.
     """
-    job_id = job_details.get("job_id")
+    job_id = job_details.get("job_id") or job_details.get("id")
     if not job_id:
-        logging.error("Job details missing job_id.")
+        logging.error("Job details missing job id.")
         return
+    job_id = str(job_id)
 
     logging.info(f"--- Starting processing for job_id: {job_id} ---")
 
@@ -407,7 +421,22 @@ async def process_job(job_details: Dict[str, Any], base_resume_details: Resume):
             logging.info(f"--- Aborting PDF generation and further processing for job_id: {job_id} due to validation failure. ---")
             return 
 
-        # 2. Generate PDF
+        # 2. Save customized resume (with or without PDF in this step)
+        if skip_pdf:
+            logging.info(f"Saving customized resume JSON only for job_id: {job_id} (PDF via pdf_generator).")
+            customized_resume_id = supabase_utils.save_customized_resume(personalized_resume_data, None)
+            if not customized_resume_id:
+                logging.error(f"Failed to save customized resume row for job_id: {job_id}")
+                return
+            update_success = supabase_utils.update_job_with_resume_link(
+                job_id, customized_resume_id, new_status="resume_generated"
+            )
+            if update_success:
+                logging.info(f"Updated job {job_id} with customized_resume_id (awaiting PDF).")
+            else:
+                logging.error(f"Failed to update job record for job_id: {job_id}")
+            return
+
         logging.info(f"Generating PDF for job_id: {job_id}")
         try:
             pdf_bytes = pdf_generator.create_resume_pdf(personalized_resume_data)
@@ -416,30 +445,22 @@ async def process_job(job_details: Dict[str, Any], base_resume_details: Resume):
             logging.info(f"PDF generation complete for job_id: {job_id}")
         except Exception as e:
             logging.error(f"Failed to generate PDF for job_id {job_id}: {e}")
-            # Skip to the next job if PDF generation fails
-            return # Stop processing this job
+            return
 
-        # 3. Upload PDF to Supabase Storage
-        # Construct a unique path, e.g., using job_id
         destination_path = f"resume_{job_id}.pdf"
         logging.info(f"Uploading PDF to {destination_path} for job_id: {job_id}")
         resume_path = supabase_utils.upload_customized_resume_to_storage(pdf_bytes, destination_path)
 
         if not resume_path:
             logging.error(f"Failed to upload resume PDF for job_id: {job_id}")
-            # Skip updating the job record if upload fails
-            return # Stop processing this job
+            return
 
         logging.info(f"Successfully uploaded PDF for job_id: {job_id}. Path: {resume_path}")
 
-        # 4. Add Customized Resume to Supabase
         logging.info("Adding customized resume to Supabase")
         customized_resume_id = supabase_utils.save_customized_resume(personalized_resume_data, resume_path)
 
-
-        # 4. Update Job Record in Supabase
         logging.info(f"Updating job record for job_id: {job_id} with resume path.")
-        # Optionally set a new status like "resume_generated" or "ready_to_apply"
         update_success = supabase_utils.update_job_with_resume_link(job_id, customized_resume_id, new_status="resume_generated")
 
         if update_success:
@@ -513,11 +534,42 @@ async def run_job_processing_cycle():
 
     logging.info("Finished job processing cycle.")
 
+
+async def run_single_job_by_id(job_id: str):
+    """Load base resume and job from Supabase; personalize without generating PDF here."""
+    raw_resume_details = supabase_utils.get_base_resume()
+    resume_path = getattr(config, "BASE_RESUME_PATH", "resume.json")
+    if raw_resume_details:
+        logging.info("Loaded base resume from Supabase.")
+    elif os.path.exists(resume_path):
+        with open(resume_path, "r", encoding="utf-8") as f:
+            raw_resume_details = json.load(f)
+    else:
+        logging.error("Base resume not found in Supabase or local file.")
+        return
+
+    for key in ["skills", "experience", "education", "projects", "certifications", "languages"]:
+        if raw_resume_details.get(key) is None:
+            raw_resume_details[key] = []
+    base_resume_details = Resume(**raw_resume_details)
+
+    job_row = supabase_utils.get_job_by_id(job_id)
+    if not job_row:
+        logging.error("Job not found: %s", job_id)
+        return
+    job_details = dict(job_row)
+    job_details["job_id"] = str(job_details.get("job_id") or job_id)
+    await process_job(job_details, base_resume_details, skip_pdf=True)
+
+
 # --- Script Entry Point ---
 if __name__ == "__main__":
     logging.info("Script started.")
     try:
-        asyncio.run(run_job_processing_cycle())
-        logging.info("Rresume processing completed successfully.")
+        if len(sys.argv) >= 2:
+            asyncio.run(run_single_job_by_id(sys.argv[1].strip()))
+        else:
+            asyncio.run(run_job_processing_cycle())
+        logging.info("Resume processing completed successfully.")
     except Exception as e:
         logging.error(f"Error during task execution: {e}", exc_info=True)

@@ -11,6 +11,8 @@ load_dotenv()
 SUPABASE_URL: str = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY: str = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_TABLE_NAME: str = "jobs"
+# Primary key column on `jobs` (uuid in the canonical schema)
+SUPABASE_JOB_PK_COL: str = "id"
 SUPABASE_CUSTOMIZED_RESUMES_TABLE_NAME = "customized_resumes"
 SUPABASE_STORAGE_BUCKET="personalized_resumes"
 SUPABASE_RESUME_STORAGE_BUCKET="resumes"
@@ -71,3 +73,39 @@ JOB_CHECK_LIMIT = 50
 ACTIVE_CHECK_TIMEOUT = 20
 ACTIVE_CHECK_MAX_RETRIES = 2
 ACTIVE_CHECK_RETRY_DELAY = 10
+
+# UK search queries
+UK_SEARCH_QUERIES = [
+    "operations manager",
+    "strategy consultant",
+    "SaaS founder",
+    "product manager",
+    "government policy",
+    "commercial manager",
+    "procurement manager",
+    "geopolitical risk",
+    "supply chain manager",
+    "investment security",
+]
+
+# Taiwan search queries
+TAIWAN_SEARCH_QUERIES = [
+    "operations manager english",
+    "product manager english",
+    "business development taiwan",
+    "SaaS",
+    "strategy english",
+    "politicl risk",
+    "procurement",
+]
+
+# Scoring threshold — only notify at scores strictly above this (e.g. 7 → 8, 9, 10)
+MATCH_SCORE_THRESHOLD = 7
+# Max Discord notifications per run (highest match_score first; remainder stay notified=false)
+MAX_DAILY_NOTIFICATIONS = 5
+# Minimum match_score (1–10) to queue for automated CV customization cycle
+MATCH_SCORE_MIN_FOR_CV = 8
+
+# Country values
+COUNTRY_UK = "uk"
+COUNTRY_TAIWAN = "taiwan"
