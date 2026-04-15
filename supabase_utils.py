@@ -4,6 +4,8 @@ from typing import Optional, Any, Dict
 from models import Resume
 import datetime # Import datetime module
 import logging # Import logging
+import re
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 # --- Initialize Supabase Client ---
 # Ensure URL and Key are provided
 if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
@@ -14,6 +16,48 @@ supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_RO
 
 def _job_pk_col() -> str:
     return getattr(config, "SUPABASE_JOB_PK_COL", "id")
+
+
+_TRACKING_QUERY_PARAMS = {
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "utm_id",
+    "gclid",
+    "fbclid",
+    "mc_cid",
+    "mc_eid",
+    "ref",
+    "ref_src",
+}
+
+
+def canonicalize_job_url(url: str) -> str:
+    """Normalize equivalent job URLs so dedupe works across tracking variants."""
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+        scheme = (parts.scheme or "https").lower()
+        netloc = parts.netloc.lower()
+        path = re.sub(r"/+", "/", parts.path or "/")
+        if path != "/" and path.endswith("/"):
+            path = path[:-1]
+        keep = []
+        for k, v in parse_qsl(parts.query, keep_blank_values=False):
+            if not k:
+                continue
+            if k.lower() in _TRACKING_QUERY_PARAMS:
+                continue
+            keep.append((k, v))
+        keep.sort(key=lambda x: (x[0], x[1]))
+        query = urlencode(keep, doseq=True)
+        return urlunsplit((scheme, netloc, path, query, ""))
+    except Exception:
+        return raw.lower()
 
 
 def normalize_job_row(row: Optional[dict]) -> Optional[dict]:
@@ -80,7 +124,7 @@ def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple[set, set, s
                     existing_company_title_keys.add((normalized_company, normalized_title))
 
                 if url and str(url).strip():
-                    existing_urls.add(str(url).strip().lower())
+                    existing_urls.add(canonicalize_job_url(str(url)))
 
             offset += batch_size
 
@@ -95,7 +139,7 @@ def _scraper_job_to_row(job: dict) -> Optional[dict]:
     """Map legacy scraper output (job_id, job_title, provider, …) to canonical jobs columns."""
     jid = job.get("job_id")
     src = job.get("provider") or job.get("source") or ""
-    url = (job.get("url") or "").strip()
+    url = canonicalize_job_url(job.get("url") or "")
     if not url and jid:
         if src == "careers_future":
             url = f"https://www.mycareersfuture.gov.sg/job/{jid}"
@@ -383,7 +427,7 @@ def update_job_resume_score(job_id: str, score: int, resume_score_stage: str = "
 
 def insert_job_if_new(job: dict) -> bool:
     """Insert job only if URL not already in table. Returns True if inserted."""
-    url = (job.get("url") or "").strip()
+    url = canonicalize_job_url(job.get("url") or "")
     if not url:
         logging.warning("insert_job_if_new: missing url, skipping.")
         return False
@@ -457,7 +501,7 @@ def get_unscored_jobs(country: str, limit: int = 100) -> list:
         response = q.execute()
         rows = []
         for r in (response.data or []):
-            u = (r.get("url") or "").strip().lower()
+            u = canonicalize_job_url(r.get("url") or "")
             if u and u in sent_urls:
                 continue
             rows.append(r)
@@ -521,7 +565,7 @@ def get_unnotified_matches(country: str, threshold: int) -> list:
         for r in (response.data or []):
             if r.get("notified") is True:
                 continue
-            u = (r.get("url") or "").strip().lower()
+            u = canonicalize_job_url(r.get("url") or "")
             if u and u in sent_urls:
                 continue
             ms = r.get("match_score")
@@ -567,7 +611,7 @@ def get_sent_job_urls(country: str, channel: str = "discord") -> set[str]:
         )
         out: set[str] = set()
         for row in (response.data or []):
-            u = (row.get("job_url") or "").strip().lower()
+            u = canonicalize_job_url(row.get("job_url") or "")
             if u:
                 out.add(u)
         return out
@@ -586,7 +630,7 @@ def record_job_notifications(records: list[dict]) -> bool:
     try:
         payload = []
         for r in records:
-            job_url = (r.get("job_url") or "").strip()
+            job_url = canonicalize_job_url(r.get("job_url") or "")
             country = (r.get("country") or "").strip()
             channel = (r.get("channel") or "discord").strip()
             if not job_url or not country:

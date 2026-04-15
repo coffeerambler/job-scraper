@@ -200,6 +200,19 @@ def _extract_job_links_from_html(
     return out
 
 
+def _title_from_url(url: str, default: str) -> str:
+    """Build a readable fallback title from URL slug/path."""
+    u = (url or "").strip()
+    if not u:
+        return default
+    slug = u.rstrip("/").split("/")[-1]
+    slug = re.sub(r"[-_]+", " ", slug)
+    slug = re.sub(r"\s+", " ", slug).strip()
+    if len(slug) >= 4:
+        return slug[:160]
+    return default
+
+
 def fetch_meet_jobs() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     try:
@@ -222,7 +235,7 @@ def fetch_meet_jobs() -> list[dict[str, Any]]:
                 limit=150,
             )
             for href in fallback_links:
-                title = "Meet.jobs role"
+                title = _title_from_url(href, "Meet.jobs role")
                 desc = _enrich_description_from_url(href, "")
                 if not _is_targeted_role(title, desc, "Unknown"):
                     continue
@@ -312,9 +325,9 @@ def fetch_tealit() -> list[dict[str, Any]]:
                 href = urljoin("https://www.tealit.com/", href)
             if not href.startswith("http"):
                 continue
-            if not _is_targeted_role(text, "", "Unknown"):
-                continue
             desc = _enrich_description_from_url(href, "")
+            if not _is_targeted_role(text, desc, "Unknown"):
+                continue
             out.append(
                 {
                     "url": href,
@@ -335,7 +348,7 @@ def fetch_tealit() -> list[dict[str, Any]]:
                 limit=150,
             )
             for href in fallback_links:
-                title = "Tealit role"
+                title = _title_from_url(href, "Tealit role")
                 desc = _enrich_description_from_url(href, "")
                 if not _is_targeted_role(title, desc, "Unknown"):
                     continue
@@ -386,9 +399,9 @@ def fetch_yourator() -> list[dict[str, Any]]:
             continue
         if href.startswith("/"):
             href = urljoin("https://www.yourator.co/", href)
-        if not _is_targeted_role(title, "", "Unknown"):
-            continue
         desc = _enrich_description_from_url(href, "")
+        if not _is_targeted_role(title, desc, "Unknown"):
+            continue
         out.append(
             {
                 "url": href,
@@ -435,7 +448,7 @@ def fetch_yourator() -> list[dict[str, Any]]:
             limit=200,
         )
         for href in fallback_links:
-            title = "Yourator role"
+            title = _title_from_url(href, "Yourator role")
             desc = _enrich_description_from_url(href, "")
             if not _is_targeted_role(title, desc, "Unknown"):
                 continue
