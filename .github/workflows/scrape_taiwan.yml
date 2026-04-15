@@ -38,5 +38,5 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          DISCORD_WEBHOOK_TAIWAN: ${{ secrets.DISCORD_WEBHOOK_TAIWAN }}
+          DISCORD_WEBHOOK_TAIWAN: ${{ secrets.DISCORD_WEBHOOK_TAIWAN_JOBS }}
         run: python notify_discord.py taiwan

@@ -149,6 +149,57 @@ def _enrich_description_from_url(url: str, current_desc: str) -> str:
     return current_desc or ""
 
 
+def _extract_job_links_from_html(
+    html: str, base_url: str, patterns: tuple[str, ...], limit: int = 300
+) -> list[str]:
+    """
+    Generic fallback parser for sources that return bot/challenge HTML or changed layouts.
+    Pulls candidate links from anchors and script text, then deduplicates.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    soup = BeautifulSoup(html, "html.parser")
+
+    def _push(url: str) -> None:
+        u = (url or "").strip()
+        if not u:
+            return
+        if u.startswith("//"):
+            u = "https:" + u
+        if u.startswith("/"):
+            u = urljoin(base_url, u)
+        if not u.startswith("http"):
+            return
+        ul = u.lower()
+        if not any(p in ul for p in patterns):
+            return
+        if u in seen:
+            return
+        seen.add(u)
+        out.append(u)
+
+    for a in soup.find_all("a", href=True):
+        _push(a.get("href", ""))
+        if len(out) >= limit:
+            return out
+
+    for script in soup.find_all("script"):
+        txt = script.string or script.get_text() or ""
+        if not txt:
+            continue
+        for m in re.finditer(r'"((?:\/|https?:\/\/)[^"]*(?:job|jobs|position)[^"]*)"', txt):
+            raw = m.group(1)
+            try:
+                raw = raw.encode("utf-8").decode("unicode_escape")
+            except Exception:
+                pass
+            _push(raw)
+            if len(out) >= limit:
+                return out
+
+    return out
+
+
 def fetch_meet_jobs() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     try:
@@ -164,6 +215,30 @@ def fetch_meet_jobs() -> list[dict[str, Any]]:
         except Exception:
             # Occasionally returns non-JSON pages (e.g., anti-bot/challenge).
             logging.warning("Meet.jobs API returned non-JSON response (status=%s).", r.status_code)
+            fallback_links = _extract_job_links_from_html(
+                r.text,
+                "https://meet.jobs/",
+                patterns=("/jobs/", "/job/"),
+                limit=150,
+            )
+            for href in fallback_links:
+                title = "Meet.jobs role"
+                desc = _enrich_description_from_url(href, "")
+                if not _is_targeted_role(title, desc, "Unknown"):
+                    continue
+                out.append(
+                    {
+                        "url": href,
+                        "title": title,
+                        "company": "Unknown",
+                        "description": desc,
+                        "source": "meet.jobs",
+                        "country": config.COUNTRY_TAIWAN,
+                        "priority_score": _priority_score(title, desc, "Unknown"),
+                    }
+                )
+            if out:
+                logging.info("Meet.jobs fallback parsed %s candidate link(s).", len(out))
             return out
     except Exception as e:
         logging.warning("Meet.jobs API failed: %s", e)
@@ -251,6 +326,30 @@ def fetch_tealit() -> list[dict[str, Any]]:
                     "priority_score": _priority_score(text[:500], "", "Unknown"),
                 }
             )
+
+        if not out:
+            fallback_links = _extract_job_links_from_html(
+                r.text,
+                "https://www.tealit.com/",
+                patterns=("/job", "job_listing", "position"),
+                limit=150,
+            )
+            for href in fallback_links:
+                title = "Tealit role"
+                desc = _enrich_description_from_url(href, "")
+                if not _is_targeted_role(title, desc, "Unknown"):
+                    continue
+                out.append(
+                    {
+                        "url": href,
+                        "title": title,
+                        "company": "Unknown",
+                        "description": desc,
+                        "source": "tealit",
+                        "country": config.COUNTRY_TAIWAN,
+                        "priority_score": _priority_score(title, desc, "Unknown"),
+                    }
+                )
         if out:
             break
 
@@ -326,6 +425,31 @@ def fetch_yourator() -> list[dict[str, Any]]:
                     )
             except Exception:
                 pass
+
+    # Final fallback: generic HTML/script link extractor for layout changes.
+    if not out:
+        fallback_links = _extract_job_links_from_html(
+            html,
+            "https://www.yourator.co/",
+            patterns=("/jobs/", "/job/"),
+            limit=200,
+        )
+        for href in fallback_links:
+            title = "Yourator role"
+            desc = _enrich_description_from_url(href, "")
+            if not _is_targeted_role(title, desc, "Unknown"):
+                continue
+            out.append(
+                {
+                    "url": href,
+                    "title": title,
+                    "company": "Unknown",
+                    "description": desc,
+                    "source": "yourator",
+                    "country": config.COUNTRY_TAIWAN,
+                    "priority_score": _priority_score(title, desc, "Unknown"),
+                }
+            )
 
     seen: set[str] = set()
     deduped: list[dict[str, Any]] = []
